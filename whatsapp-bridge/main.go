@@ -420,20 +420,24 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 // voir agence-os/server.py + hermes_control.py).
 type hermesWebhookPayload struct {
 	Sender    string `json:"sender"`
+	ChatJID   string `json:"chat_jid"`
 	Message   string `json:"message"`
 	Timestamp string `json:"timestamp"`
 }
 
 // postWebhook relaie un message entrant vers agence-os, en goroutine, avec
 // timeout court. Une erreur reseau ou un agence-os eteint ne doit jamais
-// bloquer ni casser le traitement whatsmeow normal.
-func postWebhook(sender, message string, timestamp time.Time) {
+// bloquer ni casser le traitement whatsmeow normal. chatJID est transmis
+// pour qu'agence-os puisse rejeter tout message venant d'un groupe (@g.us) :
+// seule une conversation privee avec Hermes doit pouvoir piloter l'agence.
+func postWebhook(sender, chatJID, message string, timestamp time.Time) {
 	if hermesWebhookURL == "" {
 		return
 	}
 	go func() {
 		payload := hermesWebhookPayload{
 			Sender:    sender,
+			ChatJID:   chatJID,
 			Message:   message,
 			Timestamp: timestamp.Format(time.RFC3339),
 		}
@@ -520,7 +524,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	if !msg.Info.IsFromMe && content != "" {
-		postWebhook(sender, content, msg.Info.Timestamp)
+		postWebhook(sender, chatJID, content, msg.Info.Timestamp)
 	}
 }
 
