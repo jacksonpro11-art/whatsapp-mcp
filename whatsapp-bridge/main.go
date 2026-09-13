@@ -198,8 +198,9 @@ func extractTextContent(msg *waProto.Message) string {
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -210,9 +211,9 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "", "Not connected to WhatsApp"
 	}
 
 	// Create JID for recipient
@@ -226,7 +227,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, "", fmt.Sprintf("Error parsing JID: %v", err)
 		}
 	} else {
 		// Create JID from phone number
@@ -243,7 +244,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, "", fmt.Sprintf("Error reading media file: %v", err)
 		}
 
 		// Determine media type and mime type based on file extension
@@ -292,7 +293,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, "", fmt.Sprintf("Error uploading media: %v", err)
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -322,7 +323,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, "", fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -369,13 +370,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, "", fmt.Sprintf("Error sending message: %v", err)
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, sendResp.ID, fmt.Sprintf("Message sent to %s", recipient)
 }
 
 // Extract media info from a message
@@ -423,6 +424,48 @@ type hermesWebhookPayload struct {
 	ChatJID   string `json:"chat_jid"`
 	Message   string `json:"message"`
 	Timestamp string `json:"timestamp"`
+	MediaType string `json:"media_type,omitempty"`
+	MessageID string `json:"message_id,omitempty"`
+
+	// Accuse de lecture (Receipt) : uniquement ces champs sont renseignes
+	// dans ce cas, tout ce qui precede reste vide. agence-os distingue un
+	// accuse de lecture d'un message normal par la presence de ce champ.
+	ReadMessageIDs []string `json:"read_message_ids,omitempty"`
+}
+
+// postReadReceipt relaie un accuse de lecture (l'utilisateur a ouvert la
+// conversation et vu le(s) message(s)) vers agence-os, meme mecanisme que
+// postWebhook (goroutine, timeout court, jamais bloquant).
+func postReadReceipt(reader, chatJID string, messageIDs []string, timestamp time.Time) {
+	if hermesWebhookURL == "" || len(messageIDs) == 0 {
+		return
+	}
+	go func() {
+		payload := hermesWebhookPayload{
+			Sender:         reader,
+			ChatJID:        chatJID,
+			Timestamp:      timestamp.Format(time.RFC3339),
+			ReadMessageIDs: messageIDs,
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, "POST", hermesWebhookURL, bytes.NewBuffer(body))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("[hermes-webhook] echec envoi accuse de lecture: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
 }
 
 // postWebhook relaie un message entrant vers agence-os, en goroutine, avec
@@ -430,7 +473,10 @@ type hermesWebhookPayload struct {
 // bloquer ni casser le traitement whatsmeow normal. chatJID est transmis
 // pour qu'agence-os puisse rejeter tout message venant d'un groupe (@g.us) :
 // seule une conversation privee avec Hermes doit pouvoir piloter l'agence.
-func postWebhook(sender, chatJID, message string, timestamp time.Time) {
+// mediaType/messageID permettent a agence-os de recuperer un media via
+// POST /api/download (message_id + chat_jid) quand un message n'est pas
+// que du texte.
+func postWebhook(sender, chatJID, message, mediaType, messageID string, timestamp time.Time) {
 	if hermesWebhookURL == "" {
 		return
 	}
@@ -440,6 +486,8 @@ func postWebhook(sender, chatJID, message string, timestamp time.Time) {
 			ChatJID:   chatJID,
 			Message:   message,
 			Timestamp: timestamp.Format(time.RFC3339),
+			MediaType: mediaType,
+			MessageID: messageID,
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
@@ -523,8 +571,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
-	if !msg.Info.IsFromMe && content != "" {
-		postWebhook(sender, chatJID, content, msg.Info.Timestamp)
+	if !msg.Info.IsFromMe && (content != "" || mediaType != "") {
+		postWebhook(sender, chatJID, content, mediaType, msg.Info.ID, msg.Info.Timestamp)
 	}
 }
 
@@ -764,7 +812,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, sentMessageID, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -776,8 +824,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: sentMessageID,
 		})
 	})
 
@@ -917,6 +966,30 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+
+		case *events.Receipt:
+			// Accuse de lecture reel (pas juste livre) : l'utilisateur a
+			// ouvert la conversation et vu le(s) message(s). MessageSender
+			// est toujours "moi" dans une conversation privee normale (le
+			// champ documente les cas broadcast/groupe), donc c'est bien
+			// le lecteur (Sender) qui nous interesse ici.
+			if v.Type == types.ReceiptTypeRead {
+				ids := make([]string, len(v.MessageIDs))
+				for i, id := range v.MessageIDs {
+					ids[i] = string(id)
+				}
+				postReadReceipt(v.Sender.User, v.Chat.String(), ids, v.Timestamp)
+			}
+
+		case *events.Presence:
+			// Journalise seulement (pas de nouvelle UI dediee) : utile pour
+			// confirmer que la souscription fonctionne et pour un futur
+			// usage sans reconstruire le cablage.
+			etat := "en ligne"
+			if v.Unavailable {
+				etat = "hors ligne"
+			}
+			logger.Infof("Presence %s: %s (vu la derniere fois: %s)", v.From.User, etat, v.LastSeen)
 		}
 	})
 
@@ -978,6 +1051,21 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	// Souscription a la presence d'un seul contact (le patron), optionnelle
+	// via HERMES_PRESENCE_JID (ex. "590690917145@s.whatsapp.net") : whatsmeow
+	// n'envoie des evenements Presence que pour les contacts explicitement
+	// souscrits, jamais tous les contacts par defaut.
+	if presenceJID := os.Getenv("HERMES_PRESENCE_JID"); presenceJID != "" {
+		jid, err := types.ParseJID(presenceJID)
+		if err != nil {
+			logger.Warnf("HERMES_PRESENCE_JID invalide (%s) : %v", presenceJID, err)
+		} else if err := client.SubscribePresence(context.Background(), jid); err != nil {
+			logger.Warnf("Echec de souscription a la presence de %s : %v", presenceJID, err)
+		} else {
+			logger.Infof("Souscrit a la presence de %s", presenceJID)
+		}
+	}
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
