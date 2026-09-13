@@ -42,6 +42,12 @@ type Message struct {
 	Filename  string
 }
 
+// hermesWebhookURL, si defini (HERMES_WEBHOOK_URL), recoit un POST JSON pour
+// chaque message texte entrant (agence-os/server.py, POST /api/hermes/webhook).
+// Vide = fonctionnalite desactivee, comportement inchange pour tout autre
+// deploiement de ce fork.
+var hermesWebhookURL string
+
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
@@ -409,6 +415,49 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// hermesWebhookPayload est le corps JSON envoye a agence-os pour chaque
+// message texte entrant (structure attendue par POST /api/hermes/webhook,
+// voir agence-os/server.py + hermes_control.py).
+type hermesWebhookPayload struct {
+	Sender    string `json:"sender"`
+	Message   string `json:"message"`
+	Timestamp string `json:"timestamp"`
+}
+
+// postWebhook relaie un message entrant vers agence-os, en goroutine, avec
+// timeout court. Une erreur reseau ou un agence-os eteint ne doit jamais
+// bloquer ni casser le traitement whatsmeow normal.
+func postWebhook(sender, message string, timestamp time.Time) {
+	if hermesWebhookURL == "" {
+		return
+	}
+	go func() {
+		payload := hermesWebhookPayload{
+			Sender:    sender,
+			Message:   message,
+			Timestamp: timestamp.Format(time.RFC3339),
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, "POST", hermesWebhookURL, bytes.NewBuffer(body))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("[hermes-webhook] echec envoi vers agence-os: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
@@ -468,6 +517,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+	}
+
+	if !msg.Info.IsFromMe && content != "" {
+		postWebhook(sender, content, msg.Info.Timestamp)
 	}
 }
 
@@ -793,6 +846,13 @@ func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
+
+	hermesWebhookURL = os.Getenv("HERMES_WEBHOOK_URL")
+	if hermesWebhookURL != "" {
+		logger.Infof("Webhook agence-os configure : %s", hermesWebhookURL)
+	} else {
+		logger.Infof("HERMES_WEBHOOK_URL non defini : webhook entrant desactive")
+	}
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
