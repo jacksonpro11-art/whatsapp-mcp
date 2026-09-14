@@ -898,6 +898,58 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Nettoyage ponctuel (14/09/2026) : ce numero est recycle (21 groupes
+	// herites d'un ancien titulaire, de 2023 a aujourd'hui - contenu explicite,
+	// groupes personnels/communautaires, rien lie a l'agence). Un compte
+	// Hermes dedie n'a aucune raison legitime de rester dans un groupe
+	// (hermes_control.py rejette deja tout message de groupe). Endpoints
+	// minimalistes pour lister et quitter, memes conventions que /api/send.
+	http.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		groups, err := client.GetJoinedGroups(context.Background())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		out := make([]map[string]string, 0, len(groups))
+		for _, g := range groups {
+			out = append(out, map[string]string{"jid": g.JID.String(), "name": g.Name})
+		}
+		json.NewEncoder(w).Encode(out)
+	})
+
+	http.HandleFunc("/api/groups/leave", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			JID string `json:"jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.JID == "" {
+			http.Error(w, "jid is required", http.StatusBadRequest)
+			return
+		}
+		groupJID, err := types.ParseJID(req.JID)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if err := client.LeaveGroup(context.Background(), groupJID); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"success": "true"})
+	})
+
 	// Start the server
 	// Lié à 127.0.0.1 uniquement : cette API n'a aucune authentification propre,
 	// elle ne doit jamais être joignable depuis le réseau local ou l'extérieur.
