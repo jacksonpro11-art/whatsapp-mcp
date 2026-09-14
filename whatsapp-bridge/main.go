@@ -516,6 +516,23 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
+	// WhatsApp identifie de plus en plus d'expediteurs par leur LID
+	// ("@lid", identifiant opaque) plutot que par leur numero de telephone
+	// classique ("@s.whatsapp.net") - constate en direct le 14/09/2026 :
+	// le garde-fou d'expediteur d'agence-os (hermes_control.py) compare le
+	// sender du webhook a un numero de telephone brut, donc un LID ne
+	// matchera jamais, meme pour le seul numero autorise. On resout ici,
+	// a la source, via la table LID<->PN que whatsmeow tient deja a jour
+	// (store/sqlstore/lidmap.go) - jamais de logique de resolution dupliquee
+	// cote Python.
+	if msg.Info.Sender.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), msg.Info.Sender); err == nil && !pn.IsEmpty() {
+			sender = pn.User
+		} else {
+			logger.Warnf("Failed to resolve LID sender %s to phone number: %v", msg.Info.Sender.String(), err)
+		}
+	}
+
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
